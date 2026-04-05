@@ -120,31 +120,39 @@ async def get_performance(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/reset")
-async def reset_portfolio(db: AsyncSession = Depends(get_db)):
-    """Reset portfolio to initial balance (wipes all positions and trades)."""
+async def reset_portfolio(
+    initial_balance: float | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset portfolio to initial balance (wipes all positions and trades).
+
+    Optionally pass `initial_balance` as a query param to override the default.
+    Example: POST /api/portfolio/reset?initial_balance=20000
+    """
+    balance = initial_balance if initial_balance and initial_balance > 0 else settings.initial_balance
+
     result = await db.execute(select(Portfolio).where(Portfolio.id == 1))
     portfolio = result.scalar_one_or_none()
 
-    await db.execute(
-        __import__("sqlalchemy", fromlist=["delete"]).delete(Position).where(Position.portfolio_id == 1)
-    )
-    await db.execute(
-        __import__("sqlalchemy", fromlist=["delete"]).delete(Trade).where(Trade.portfolio_id == 1)
-    )
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(Position).where(Position.portfolio_id == 1))
+    await db.execute(sa_delete(Trade).where(Trade.portfolio_id == 1))
 
     if portfolio:
-        portfolio.cash_balance = settings.initial_balance
-        portfolio.total_value = settings.initial_balance
+        portfolio.initial_balance = balance
+        portfolio.cash_balance = balance
+        portfolio.total_value = balance
     else:
         portfolio = Portfolio(
             id=1, name="Default",
-            initial_balance=settings.initial_balance,
-            cash_balance=settings.initial_balance,
-            total_value=settings.initial_balance,
+            initial_balance=balance,
+            cash_balance=balance,
+            total_value=balance,
         )
         db.add(portfolio)
 
-    return {"message": "Portfolio reset successfully", "balance": settings.initial_balance}
+    await db.commit()
+    return {"message": "Portfolio reset successfully", "balance": balance}
 
 
 @router.post("/positions/{position_id}/controls")
