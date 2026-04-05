@@ -91,6 +91,73 @@ def _get_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
 
+def _technical_signal(indicators: dict, quote: dict, position_qty: float) -> dict:
+    """
+    RSI + MACD rule-based signal used as fallback when Claude API is unavailable.
+
+    Rules:
+      BUY  — RSI < 40 AND MACD histogram positive (momentum turning up)
+      SELL — RSI > 65 AND we hold a position AND MACD histogram negative
+      HOLD — everything else
+    """
+    try:
+        rsi = float(indicators.get("rsi_14", 50))
+    except (TypeError, ValueError):
+        rsi = 50.0
+
+    try:
+        macd_hist = float(indicators.get("macd_histogram", 0))
+    except (TypeError, ValueError):
+        macd_hist = 0.0
+
+    price = float(quote.get("current_price", 0))
+
+    if rsi < 40 and macd_hist > 0:
+        signal = "BUY"
+        confidence = round(min(0.85, 0.5 + (40 - rsi) / 100 + macd_hist / (price or 1) * 10), 2)
+        reasoning = (
+            f"RSI at {rsi:.1f} indicates oversold conditions. "
+            f"Positive MACD histogram ({macd_hist:+.4f}) confirms upward momentum. "
+            "Technical setup favours a long entry."
+        )
+        risk = "LOW" if rsi < 30 else "MEDIUM"
+    elif rsi > 65 and macd_hist < 0 and position_qty > 0:
+        signal = "SELL"
+        confidence = round(min(0.85, 0.5 + (rsi - 65) / 100 + abs(macd_hist) / (price or 1) * 10), 2)
+        reasoning = (
+            f"RSI at {rsi:.1f} indicates overbought conditions. "
+            f"Negative MACD histogram ({macd_hist:+.4f}) signals fading momentum. "
+            "Exiting position to lock in gains."
+        )
+        risk = "LOW" if rsi > 75 else "MEDIUM"
+    else:
+        signal = "HOLD"
+        confidence = 0.55
+        reasoning = (
+            f"RSI at {rsi:.1f} and MACD histogram {macd_hist:+.4f} — "
+            "no clear directional edge. Holding current position."
+        )
+        risk = "LOW"
+
+    sl_pct, tp_pct = 0.05, 0.10
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "key_factors": [f"RSI={rsi:.1f}", f"MACD_hist={macd_hist:+.4f}", "Technical fallback (no API key)"],
+        "risk_assessment": risk,
+        "suggested_entry": round(price, 4) if signal == "BUY" else None,
+        "suggested_stop_loss": round(price * (1 - sl_pct), 4) if signal == "BUY" else None,
+        "suggested_take_profit": round(price * (1 + tp_pct), 4) if signal == "BUY" else None,
+        "suggested_position_size_pct": 0.08 if signal != "HOLD" else None,
+        "time_horizon": "SWING",
+        "sentiment_score": 0.3 if signal == "BUY" else (-0.3 if signal == "SELL" else 0.0),
+        "_raw_prompt": "technical_fallback",
+        "_raw_response": f"RSI={rsi:.1f} MACD_hist={macd_hist:+.4f}",
+        "_technical_data": json.dumps(indicators),
+    }
+
+
 def _parse_signal_json(raw: str) -> dict:
     """Extract and parse JSON from Claude response, with fallback."""
     text = raw.strip()
@@ -163,6 +230,11 @@ async def get_trading_signal(
         **indicators,
     )
 
+    # Use technical fallback if API key is absent
+    if not settings.anthropic_api_key:
+        logger.info("No ANTHROPIC_API_KEY — using RSI/MACD technical signal for %s", symbol)
+        return _technical_signal(indicators, quote, position_qty)
+
     client = _get_client()
 
     def _call_api():
@@ -173,15 +245,18 @@ async def get_trading_signal(
             messages=[{"role": "user", "content": user_message}],
         )
 
-    loop = asyncio.get_event_loop()
-    response = await loop.run_in_executor(None, _call_api)
-    raw_response = response.content[0].text
-
-    parsed = _parse_signal_json(raw_response)
-    parsed["_raw_prompt"] = user_message
-    parsed["_raw_response"] = raw_response
-    parsed["_technical_data"] = json.dumps(indicators)
-    return parsed
+    try:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, _call_api)
+        raw_response = response.content[0].text
+        parsed = _parse_signal_json(raw_response)
+        parsed["_raw_prompt"] = user_message
+        parsed["_raw_response"] = raw_response
+        parsed["_technical_data"] = json.dumps(indicators)
+        return parsed
+    except Exception as exc:
+        logger.warning("Claude API call failed (%s) — falling back to technical signal for %s", exc, symbol)
+        return _technical_signal(indicators, quote, position_qty)
 
 
 async def get_trade_explanation(
